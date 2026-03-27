@@ -1,0 +1,346 @@
+"""
+Module: docx_builder
+Responsibility: Opens QIS template DOCX, finds all "Refer Section X.X.X"
+placeholders, injects extracted PDF content (text + tables + images),
+cleans injected noise (headers/footers/page numbers), saves output DOCX.
+
+Noise detection is fully automatic — no hardcoded company names.
+The auto-detected blocklist comes from pdf_extractor._build_noise_blocklist().
+"""
+import io
+import re
+import copy
+import os
+import docx
+from docx.shared import RGBColor, Inches
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+from typing import Dict, Set
+from logger_setup import get_logger
+
+PLACEHOLDER_PATTERN = re.compile(
+    r"Refer\s+(?:the\s+)?section\s+(\d+(?:\.[a-zA-Z0-9]+)+)",
+    re.IGNORECASE
+)
+
+MANUAL_ENTRY_SECTIONS = {'1.2', '1.3', '1.4', '1.5', '1.5.1', '1.5.2', '1.6'}
+
+# Generic regex patterns — work for ANY document, no company-specific strings
+_PAGE_NUM_RE = re.compile(r'^\d{1,4}$')
+_PAGE_OF_RE  = re.compile(r'^\d+\s+of\s+\d+\s*$', re.IGNORECASE)
+
+
+def _is_noise_paragraph(text: str, blocklist: Set[str]) -> bool:
+    """
+    Returns True if text is a header/footer/page-number noise line.
+
+    Uses two layers:
+    1. Auto-detected blocklist (strings that repeat in top/bottom margins)
+    2. Generic document-agnostic heuristics (page numbers, short ALL-CAPS)
+    """
+    text = text.strip()
+    if not text:
+        return False
+
+    norm = " ".join(text.lower().split())
+
+    # Layer 1: auto-detected repeating header/footer text
+    if norm in blocklist:
+        return True
+
+    # Layer 2: bare page numbers  ("42"  or  "42 of 100")
+    if _PAGE_NUM_RE.match(norm):
+        return True
+    if _PAGE_OF_RE.match(norm):
+        return True
+
+    # Layer 3: very short ALL-CAPS lines — running header artefacts
+    # (e.g. "INTRODUCTION", "MODULE 3") — only strip if <= 3 words & < 25 chars
+    if len(text) < 25 and text.isupper() and len(text.split()) <= 3:
+        return True
+
+    return False
+
+
+def _is_footer_table_row(row, blocklist: Set[str]) -> bool:
+    """
+    Returns True if a table row is entirely noise (header/footer row).
+
+    A footer row must satisfy:
+    - At least one cell matches the auto-detected blocklist, AND
+    - Every other non-empty cell is a bare page number.
+
+    This is fully generic — no company names needed.
+    """
+    cell_texts = [cell.text.strip() for cell in row.cells]
+    if not any(cell_texts):
+        return False
+
+    has_blocklist_hit = False
+    for t in cell_texts:
+        if not t:
+            continue
+        norm = " ".join(t.lower().split())
+        if norm in blocklist:
+            has_blocklist_hit = True
+        elif not (_PAGE_NUM_RE.match(t) and t.isdigit() and int(t) < 10000):
+            # This cell has real content — row is NOT a footer
+            return False
+
+    return has_blocklist_hit
+
+
+def _clean_injected_content(
+    src_doc,
+    blocklist: Set[str],
+    logger,
+    section_num: str
+):
+    """
+    Cleans noise from pdf2docx-converted DOCX BEFORE injecting into template.
+    Uses the auto-detected blocklist — no hardcoded company strings.
+    """
+    removed = 0
+
+    for para in src_doc.paragraphs:
+        if _is_noise_paragraph(para.text, blocklist):
+            para.clear()
+            removed += 1
+
+    for table in src_doc.tables:
+        for row in table.rows:
+            if _is_footer_table_row(row, blocklist):
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        para.clear()
+                removed += 1
+
+    if removed:
+        logger.info(
+            f"Section {section_num}: cleaned {removed} "
+            f"noise items (headers/footers/page numbers)."
+        )
+
+
+def _iter_all_paragraphs(doc):
+    """Yields every paragraph in body AND inside every table cell."""
+    for p in doc.paragraphs:
+        yield p
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    yield p
+
+
+def _insert_warning(paragraph, section: str):
+    """Replaces placeholder with visible red WARNING text."""
+    paragraph.clear()
+    run = paragraph.add_run(
+        f"[WARNING: Could not populate section {section} - check source PDF]"
+    )
+    run.bold = True
+    run.font.color.rgb = RGBColor(255, 0, 0)
+
+
+def _strip_drawing_elements(element):
+    """
+    Removes drawing/image XML nodes using Clark notation.
+    Images are re-inserted separately via PyMuPDF bytes.
+    """
+    DRAWING_TAGS = {
+        '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}drawing',
+        '{urn:schemas-microsoft-com:vml}imagedata',
+        '{http://schemas.openxmlformats.org/drawingml/2006/main}blipFill',
+    }
+    to_remove = [n for n in element.iter() if n.tag in DRAWING_TAGS]
+    for node in to_remove:
+        parent = node.getparent()
+        if parent is not None:
+            try:
+                parent.remove(node)
+            except Exception:
+                pass
+
+
+def _inject_docx_content(
+    src_docx_path: str,
+    anchor_p_xml,
+    blocklist: Set[str],
+    logger,
+    section_num: str
+):
+    """
+    Opens pdf2docx temp DOCX, cleans noise, copies body elements
+    into template after anchor. Skips sectPr and strips drawing refs.
+    Returns new anchor (last inserted element).
+    """
+    current_anchor = anchor_p_xml
+    try:
+        src_doc = docx.Document(src_docx_path)
+    except Exception as e:
+        logger.error(
+            f"Cannot open converted DOCX for section {section_num}: {e}"
+        )
+        return current_anchor
+
+    _clean_injected_content(src_doc, blocklist, logger, section_num)
+
+    for element in src_doc.element.body:
+        if element.tag.endswith('}sectPr') or element.tag == 'sectPr':
+            continue
+        try:
+            new_el = copy.deepcopy(element)
+            _strip_drawing_elements(new_el)
+            current_anchor.addnext(new_el)
+            current_anchor = new_el
+        except Exception as el_e:
+            logger.warning(
+                f"Skipped element for section {section_num}: {el_e}"
+            )
+
+    return current_anchor
+
+
+def process_template(
+    template_path:       str,
+    output_path:         str,
+    section_map:         Dict[str, str],
+    log_folder:          str,
+    section_page_limits: Dict[str, int] = None,
+    section_start_pages: Dict[str, int] = None,
+):
+    """
+    Main pipeline:
+    1. Open QIS template DOCX
+    2. Scan all paragraphs + table cells for placeholders
+    3. Extract + clean + inject content per section
+    4. Save populated output DOCX
+    Returns: (sections_filled, warnings_count, failures)
+    """
+    logger = get_logger(log_folder)
+    from pdf_extractor import extract_pdf_content
+
+    if section_page_limits is None:
+        section_page_limits = {}
+    if section_start_pages is None:
+        section_start_pages = {}
+
+    try:
+        doc = docx.Document(template_path)
+    except Exception as e:
+        logger.error(f"Failed to open template: {e}")
+        raise
+
+    sections_filled    = 0
+    warnings_count     = 0
+    failures           = 0
+    processed_sections = set()
+
+    logger.info("Starting QIS template placeholder scan.")
+
+    for paragraph in _iter_all_paragraphs(doc):
+        match = PLACEHOLDER_PATTERN.search(paragraph.text)
+        if not match:
+            continue
+
+        section_num = match.group(1)
+        logger.info(f"Found placeholder: {section_num}")
+
+        if section_num in MANUAL_ENTRY_SECTIONS:
+            logger.info(
+                f"Section {section_num}: Module 1 admin - leave for manual entry."
+            )
+            continue
+
+        if section_num not in section_map:
+            logger.warning(
+                f"Section {section_num}: no source PDF mapped. Inserting warning."
+            )
+            _insert_warning(paragraph, section_num)
+            warnings_count += 1
+            failures += 1
+            continue
+
+        if section_num in processed_sections:
+            logger.info(
+                f"Section {section_num}: duplicate placeholder - clearing."
+            )
+            paragraph.clear()
+            continue
+
+        pdf_path = section_map[section_num]
+        logger.info(
+            f"Processing {section_num} from '{os.path.basename(pdf_path)}'"
+        )
+
+        try:
+            content = extract_pdf_content(
+                pdf_path            = pdf_path,
+                log_folder          = log_folder,
+                section_num         = section_num,
+                section_page_limits = section_page_limits,
+                section_start_pages = section_start_pages,
+            )
+
+            paragraph.clear()
+            current_anchor = paragraph._p
+
+            if content.docx_path and os.path.exists(content.docx_path):
+                current_anchor = _inject_docx_content(
+                    src_docx_path = content.docx_path,
+                    anchor_p_xml  = current_anchor,
+                    blocklist     = content.noise_blocklist,
+                    logger        = logger,
+                    section_num   = section_num
+                )
+                try:
+                    os.remove(content.docx_path)
+                except Exception:
+                    pass
+            else:
+                logger.warning(
+                    f"Section {section_num}: no converted DOCX available."
+                )
+
+            for idx, img_bytes in enumerate(content.images):
+                try:
+                    img_stream     = io.BytesIO(img_bytes)
+                    new_p_xml      = OxmlElement('w:p')
+                    current_anchor.addnext(new_p_xml)
+                    current_anchor = new_p_xml
+
+                    tmp_para = doc.add_paragraph()
+                    run      = tmp_para.add_run()
+                    run.add_picture(img_stream, width=Inches(5.5))
+
+                    for r_elem in tmp_para._p.findall(qn('w:r')):
+                        new_p_xml.append(copy.deepcopy(r_elem))
+
+                    tmp_para._p.getparent().remove(tmp_para._p)
+
+                except Exception as img_e:
+                    logger.warning(
+                        f"Section {section_num} image #{idx}: {img_e}"
+                    )
+
+            sections_filled += 1
+            processed_sections.add(section_num)
+            logger.info(f"Section {section_num}: populated successfully.")
+
+        except Exception as e:
+            logger.error(
+                f"Section {section_num} failed: {e}", exc_info=True
+            )
+            _insert_warning(paragraph, section_num)
+            warnings_count += 1
+            failures += 1
+
+    logger.info(f"Saving output to {output_path}")
+    try:
+        doc.save(output_path)
+    except Exception as e:
+        logger.error(f"Failed to save: {e}")
+        raise
+
+    return sections_filled, warnings_count, failures

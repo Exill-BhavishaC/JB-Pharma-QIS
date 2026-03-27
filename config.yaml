@@ -1,0 +1,20 @@
+template_docx_path:    "D:\\JB Pharma internal\\JB Pharma\\Tagging- mapping logic\\Tagging- mapping logic\\QUALITY INFORMATION SUMMARY.docx"
+mapping_logic_pdf_path: ""
+source_pdf_folder:     "D:\\JB Automation\\Cardiolek\\Module 3\\32-Body-Data"
+output_docx_path:      "D:\\JB Pharma internal\\JB Pharma\\Cardiolek\\Output_QIS.docx"
+log_folder:            "D:\\JB Pharma internal\\JB Pharma\\Cardiolek"
+
+# How many pages to SKIP at start of each PDF (0-based)
+# These are cover pages, TOC pages, signature pages — not real content
+section_start_pages:
+  "3.2.P.2":   2    # Skip cover(p1) + TOC(p2), start at page 3
+  "3.2.P.3.5": 2    # Skip cover pages, start at process validation content
+  "3.2.P.7":   1    # Skip cover page, start at page 2 (the real summary text)
+
+# Max content pages per section after skipping cover pages
+section_page_limits:
+  "3.2.P.2":   5    # Take 5 pages of real content after skipping covers
+  "3.2.P.3.5": 3    # Take 3 pages of real content
+  "3.2.P.7":   2    # Take 2 pages of real content (summary + first spec page)
+  "3.2.S.6":   3
+  "3.2.S.7":   3

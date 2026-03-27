@@ -1,0 +1,83 @@
+"""
+Module: config_loader
+Responsibility: Reads config.yaml, validates all paths, and returns a typed config object.
+"""
+
+import os
+import yaml
+from dataclasses import dataclass, field
+from typing import Dict
+
+
+@dataclass
+class Config:
+    """Strongly typed configuration object"""
+    template_docx_path:   str
+    source_pdf_folder:    str
+    output_docx_path:     str
+    log_folder:           str
+    mapping_logic_pdf_path: str                    = ""
+    section_page_limits:  Dict[str, int]           = field(default_factory=dict)
+    section_start_pages:  Dict[str, int]           = field(default_factory=dict)
+
+
+def load_config(config_path: str = "config.yaml") -> Config:
+    """
+    Reads config.yaml, validates paths exist before starting,
+    and returns a typed Config object.
+    """
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as file:
+        try:
+            data = yaml.safe_load(file)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Failed to parse YAML configuration: {e}")
+
+    required_keys = [
+        "template_docx_path",
+        "source_pdf_folder",
+        "output_docx_path",
+        "log_folder",
+    ]
+    for key in required_keys:
+        if key not in data:
+            raise KeyError(f"Missing required configuration key: {key}")
+
+    if not os.path.exists(data["template_docx_path"]):
+        raise FileNotFoundError(
+            f"Template DOCX not found: {data['template_docx_path']}"
+        )
+
+    if not os.path.exists(data["source_pdf_folder"]):
+        raise NotADirectoryError(
+            f"Source PDF folder not found: {data['source_pdf_folder']}"
+        )
+
+    output_dir = os.path.dirname(data["output_docx_path"])
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+    if not os.path.exists(data["log_folder"]):
+        os.makedirs(data["log_folder"], exist_ok=True)
+
+    raw_limits = data.get("section_page_limits", {}) or {}
+    section_page_limits = {
+        str(k): int(v) for k, v in raw_limits.items()
+    }
+
+    raw_starts = data.get("section_start_pages", {}) or {}
+    section_start_pages = {
+        str(k): int(v) for k, v in raw_starts.items()
+    }
+
+    return Config(
+        template_docx_path   = data["template_docx_path"],
+        mapping_logic_pdf_path = data.get("mapping_logic_pdf_path", ""),
+        source_pdf_folder    = data["source_pdf_folder"],
+        output_docx_path     = data["output_docx_path"],
+        log_folder           = data["log_folder"],
+        section_page_limits  = section_page_limits,
+        section_start_pages  = section_start_pages,
+    )
