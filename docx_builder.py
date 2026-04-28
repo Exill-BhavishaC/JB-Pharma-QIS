@@ -1929,6 +1929,90 @@ def _drop_repeated_header_rows_within_tables(src_doc, logger, section_num: str) 
     return removed
 
 
+def _merge_fragment_rows_in_p334_tables(src_doc, logger, section_num: str) -> int:
+    """
+    Merges short, broken rows created by pdf2docx inside 3.2.P.3.4 tables.
+    """
+    merged = 0
+
+    def _norm(text: str) -> str:
+        return " ".join((text or "").split())
+
+    stage_keywords = {
+        "compounding",
+        "filtration",
+        "cleaning",
+        "sterilization",
+        "formulation",
+        "filling",
+        "mixing",
+    }
+
+    for table in src_doc.tables:
+        if not table.rows:
+            continue
+
+        header_cells = [
+            _norm(cell.text).lower() for cell in _safe_row_cells(table.rows[0])
+        ]
+        header_text = " ".join(header_cells)
+        if "process stage" not in header_text or "acceptance criteria" not in header_text:
+            continue
+
+        prev_row = table.rows[0]
+        prev_cells = _safe_row_cells(prev_row)
+        for row in list(table.rows)[1:]:
+            cells = _safe_row_cells(row)
+            if not cells or not prev_cells:
+                continue
+
+            cell_texts = [_norm(c.text) for c in cells]
+            non_empty = [(i, t) for i, t in enumerate(cell_texts) if t]
+
+            if not non_empty:
+                row._tr.getparent().remove(row._tr)
+                merged += 1
+                continue
+
+            is_fragment = False
+            if len(non_empty) == 1:
+                is_fragment = True
+            else:
+                total_len = sum(len(t) for _, t in non_empty)
+                if len(non_empty) <= 3 and total_len <= 18:
+                    is_fragment = True
+
+            if non_empty:
+                first_text = non_empty[0][1].lower()
+                if any(first_text.startswith(k) for k in stage_keywords):
+                    is_fragment = False
+
+            if is_fragment:
+                for idx, text in non_empty:
+                    if idx >= len(prev_cells):
+                        continue
+                    prior = _norm(prev_cells[idx].text)
+                    if prior.endswith("-"):
+                        merged_text = prior[:-1] + text
+                    elif prior:
+                        merged_text = f"{prior} {text}"
+                    else:
+                        merged_text = text
+                    prev_cells[idx].text = _clean_text(merged_text)
+                row._tr.getparent().remove(row._tr)
+                merged += 1
+                continue
+
+            prev_row = row
+            prev_cells = cells
+
+    if merged:
+        logger.info(
+            f"Section {section_num}: merged {merged} fragmented row(s) in 3.2.P.3.4 tables."
+        )
+    return merged
+
+
 def _drop_outlier_table_schemas(src_doc, logger, section_num: str) -> int:
     """
     Removes minority table schemas when one column layout clearly dominates.
@@ -2443,6 +2527,13 @@ def _inject_docx_content(
     _clean_injected_content(src_doc, blocklist, logger, section_num)
     _merge_split_tables(src_doc, logger, section_num)
 
+    if table_only and section_num == "3.2.P.3.4":
+        _drop_outlier_table_schemas(src_doc, logger, section_num)
+        _drop_consecutive_duplicate_table_headers(src_doc, logger, section_num)
+        _merge_consecutive_continuation_tables(src_doc, logger, section_num)
+        _drop_repeated_header_rows_within_tables(src_doc, logger, section_num)
+        _merge_fragment_rows_in_p334_tables(src_doc, logger, section_num)
+
     effective_include_pdf_tables = include_pdf_tables
     suppress_paragraphs = False
     if not include_pdf_tables:
@@ -2680,14 +2771,6 @@ def process_template(
                     logger.info(f"Section {section_num}: populated successfully.")
                     continue
 
-            if section_num == "3.2.P.3.4":
-                paragraph.clear()
-                if _populate_p334_template_section(doc, current_anchor, pdf_path, logger):
-                    sections_filled += 1
-                    processed_sections.add(section_num)
-                    logger.info(f"Section {section_num}: populated successfully.")
-                    continue
-
             if section_num == "3.2.P.3.2":
                 paragraph.clear()
                 if _populate_p332_template_section(doc, current_anchor, pdf_path, logger):
@@ -2729,7 +2812,24 @@ def process_template(
                         if low.startswith("(b)") and "narrative description" in low:
                             current_anchor = p._p
                             break
-
+                _remove_tables_after_anchor_until_subpoint(
+                    anchor_xml=current_anchor,
+                    logger=logger,
+                    section_num=section_num,
+                )
+            elif section_num == "3.2.P.3.4":
+                # Insert the table after (a) summary line.
+                paragraph_index = None
+                for idx, p in enumerate(doc.paragraphs):
+                    if p._p == paragraph._p:
+                        paragraph_index = idx
+                        break
+                if paragraph_index is not None:
+                    for p in doc.paragraphs[paragraph_index + 1 : paragraph_index + 14]:
+                        low = p.text.strip().lower()
+                        if low.startswith("(a)") and "summary of controls performed at the critical steps" in low:
+                            current_anchor = p._p
+                            break
                 _remove_tables_after_anchor_until_subpoint(
                     anchor_xml=current_anchor,
                     logger=logger,
@@ -2743,13 +2843,6 @@ def process_template(
                 handled_by_template_fill = False
                 if section_num == "3.2.S.2.3":
                     handled_by_template_fill = _populate_s223_template_section(
-                        doc=doc,
-                        anchor_xml=current_anchor,
-                        pdf_path=pdf_path,
-                        logger=logger,
-                    )
-                elif section_num == "3.2.P.3.4":
-                    handled_by_template_fill = _populate_p334_template_section(
                         doc=doc,
                         anchor_xml=current_anchor,
                         pdf_path=pdf_path,
@@ -2778,6 +2871,10 @@ def process_template(
                 use_table_only = table_only_all_sections or (
                     section_num in table_only_sections
                 )
+                if section_num == "3.2.P.3.4":
+                    use_table_only = True
+                    if not table_keyword:
+                        table_keyword = "Process stage"
                 if table_keyword:
                     use_table_only = True
                 tables_before = len(doc.tables)
