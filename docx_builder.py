@@ -222,7 +222,7 @@ def _remove_empty_visual_tables(doc, logger) -> int:
         text_cells = 0
 
         for row in table.rows:
-            for cell in row.cells:
+            for cell in _safe_row_cells(row):
                 total_cells += 1
                 text = get_text(cell)
 
@@ -270,7 +270,7 @@ def _remove_low_content_injected_tables(doc, logger, keep_first_n_tables: int) -
         text_cells = 0
         text_chars = 0
         for row in table.rows:
-            for cell in row.cells:
+            for cell in _safe_row_cells(row):
                 total_cells += 1
                 text = get_text(cell)
                 if text:
@@ -347,7 +347,7 @@ def _is_footer_table_row(row, blocklist: Set[str]) -> bool:
 
     This is fully generic â€” no company names needed.
     """
-    cell_texts = [cell.text.strip() for cell in row.cells]
+    cell_texts = [cell.text.strip() for cell in _safe_row_cells(row)]
     if not any(cell_texts):
         return False
 
@@ -393,7 +393,7 @@ def _clean_injected_content(
     for table in src_doc.tables:
         for row in table.rows:
             if _is_footer_table_row(row, blocklist):
-                for cell in row.cells:
+                for cell in _safe_row_cells(row):
                     for para in cell.paragraphs:
                         para.clear()
                 removed += 1
@@ -1600,16 +1600,27 @@ def _element_text_content(element) -> str:
     return ''.join(t.text or '' for t in element.iter(f'{{{_NS}}}t')).strip()
 
 
+def _safe_row_cells(row):
+    """
+    Returns row cells safely.
+    Some converted DOCX tables contain broken vertical-merge references and
+    python-docx can raise ValueError while resolving row.cells.
+    """
+    try:
+        return tuple(row.cells)
+    except Exception:
+        return tuple()
+
+
 def _iter_all_paragraphs(doc):
     """Yields every paragraph in body AND inside every table cell."""
     for p in doc.paragraphs:
         yield p
     for table in doc.tables:
-        for tr in table._tbl.tr_lst:
-            for tc in tr.tc_lst:
-                cell = _Cell(tc, table)
-                for p in tc.p_lst:
-                    yield Paragraph(p, cell)
+        for row in table.rows:
+            for cell in _safe_row_cells(row):
+                for p in cell.paragraphs:
+                    yield p
 
 
 def _insert_warning(paragraph, section: str):
@@ -1643,6 +1654,360 @@ def _strip_drawing_elements(element):
                 parent.remove(node)
             except Exception:
                 pass
+
+def _analyze_injected_doc_layout(src_doc) -> dict:
+    """Computes simple structure metrics used to decide table auto-inclusion."""
+    body_elements = [
+        elem for elem in src_doc.element.body
+        if elem.tag.split('}')[-1] != 'sectPr'
+    ]
+
+    table_count = 0
+    rich_table_count = 0
+    table_text_chars = 0
+    nonblank_paragraph_count = 0
+
+    for elem in body_elements:
+        tag_name = elem.tag.split('}')[-1]
+        if tag_name == 'tbl':
+            table_count += 1
+            tbl_text = _element_text_content(elem)
+            table_text_chars += len(tbl_text)
+
+            rows = len(elem.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr'))
+            first_row = elem.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr')
+            cols = len(first_row.findall('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc')) if first_row is not None else 0
+
+            if rows >= 8 and cols >= 3 and len(tbl_text) >= 250:
+                rich_table_count += 1
+        elif tag_name == 'p':
+            if _element_text_content(elem):
+                nonblank_paragraph_count += 1
+
+    return {
+        "table_count": table_count,
+        "rich_table_count": rich_table_count,
+        "table_text_chars": table_text_chars,
+        "nonblank_paragraph_count": nonblank_paragraph_count,
+    }
+
+
+def _should_auto_include_tables(layout: dict) -> bool:
+    """
+    Enables table injection for table-dominant converted sections.
+    Keeps behavior generic and avoids section-specific hardcoding.
+    """
+    return (
+        layout.get("rich_table_count", 0) >= 2
+        and layout.get("table_count", 0) >= 2
+        and layout.get("table_text_chars", 0) >= 1000
+        and layout.get("nonblank_paragraph_count", 0) <= 4
+    )
+
+
+def _table_header_signature(table_element) -> str:
+    """Builds a normalized signature from the first row of a table element."""
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    first_row = table_element.find(f'{{{_NS}}}tr')
+    if first_row is None:
+        return ""
+
+    cells = first_row.findall(f'{{{_NS}}}tc')
+    if not cells:
+        return ""
+
+    parts: list[str] = []
+    for cell in cells:
+        text = ''.join(t.text or '' for t in cell.iter(f'{{{_NS}}}t'))
+        norm = re.sub(r'\s+', ' ', text).strip().lower()
+        norm = re.sub(r'[^a-z0-9]+', ' ', norm).strip()
+        parts.append(norm)
+
+    non_empty = [p for p in parts if p]
+    if len(non_empty) < 2:
+        return ""
+    return '|'.join(parts)
+
+
+def _row_cell_signature(row_element) -> list[str]:
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    cells = row_element.findall(f'{{{_NS}}}tc')
+    parts: list[str] = []
+    for cell in cells:
+        text = ''.join(t.text or '' for t in cell.iter(f'{{{_NS}}}t'))
+        norm = re.sub(r'\s+', ' ', text).strip().lower()
+        norm = re.sub(r'[^a-z0-9]+', ' ', norm).strip()
+        parts.append(norm)
+    return parts
+
+
+def _row_matches_header_signature(row_element, header_signature: list[str]) -> bool:
+    row_signature = _row_cell_signature(row_element)
+    if not row_signature or not header_signature:
+        return False
+    if len(row_signature) != len(header_signature):
+        return False
+
+    comparable = 0
+    matched = 0
+    for header_cell, row_cell in zip(header_signature, row_signature):
+        if not header_cell and not row_cell:
+            continue
+        comparable += 1
+        if not header_cell or not row_cell:
+            continue
+        if row_cell == header_cell or row_cell in header_cell or header_cell in row_cell:
+            matched += 1
+
+    if comparable < 2:
+        return False
+    return (matched / comparable) >= 0.75
+
+
+def _table_column_count(table_element) -> int:
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    first_row = table_element.find(f'{{{_NS}}}tr')
+    if first_row is None:
+        return 0
+    return len(first_row.findall(f'{{{_NS}}}tc'))
+
+
+def _drop_consecutive_duplicate_table_headers(src_doc, logger, section_num: str) -> int:
+    """
+    Removes first-row headers that repeat across consecutive tables.
+    This handles PDF page-split continuation tables cleanly.
+    """
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    removed = 0
+    last_header_signature = ""
+
+    for element in src_doc.element.body:
+        if element.tag.split('}')[-1] != 'tbl':
+            continue
+
+        signature = _table_header_signature(element)
+        if not signature:
+            continue
+
+        rows = element.findall(f'{{{_NS}}}tr')
+        if (
+            last_header_signature
+            and signature == last_header_signature
+            and len(rows) > 1
+        ):
+            first_row = rows[0]
+            parent = first_row.getparent()
+            if parent is not None:
+                parent.remove(first_row)
+                removed += 1
+            continue
+
+        last_header_signature = signature
+
+    if removed:
+        logger.info(
+            f"Section {section_num}: removed {removed} repeated continuation table header row(s)."
+        )
+    return removed
+
+
+def _merge_consecutive_continuation_tables(src_doc, logger, section_num: str) -> int:
+    """
+    Merges consecutive tables that share the same column schema and are not
+    separated by non-empty paragraphs. This smooths page-break table splits.
+    """
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    merged = 0
+
+    previous_table = None
+    previous_cols = 0
+    gap_paragraphs = []
+    gap_nonblank_count = 0
+    gap_text_chars = 0
+
+    for elem in list(src_doc.element.body):
+        tag_name = elem.tag.split('}')[-1]
+
+        if tag_name == 'p':
+            text = " ".join(_element_text_content(elem).split())
+            gap_paragraphs.append(elem)
+            if text:
+                gap_nonblank_count += 1
+                gap_text_chars += len(text)
+            continue
+
+        if tag_name != 'tbl':
+            previous_table = None
+            previous_cols = 0
+            gap_paragraphs = []
+            gap_nonblank_count = 0
+            gap_text_chars = 0
+            continue
+
+        cols = _table_column_count(elem)
+
+        # Allow merge across tiny spillover text fragments from page-split rows.
+        # Significant narrative between tables still blocks merging.
+        has_significant_gap = (
+            gap_nonblank_count > 1
+            or gap_text_chars > 90
+        )
+
+        can_merge = (
+            previous_table is not None
+            and not has_significant_gap
+            and cols > 0
+            and cols == previous_cols
+        )
+
+        if can_merge:
+            for row in elem.findall(f'{{{_NS}}}tr'):
+                previous_table.append(copy.deepcopy(row))
+
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+
+            for gap_elem in gap_paragraphs:
+                gap_parent = gap_elem.getparent()
+                if gap_parent is not None:
+                    try:
+                        gap_parent.remove(gap_elem)
+                    except Exception:
+                        pass
+
+            merged += 1
+            gap_paragraphs = []
+            gap_nonblank_count = 0
+            gap_text_chars = 0
+            continue
+
+        previous_table = elem
+        previous_cols = cols
+        gap_paragraphs = []
+        gap_nonblank_count = 0
+        gap_text_chars = 0
+
+    if merged:
+        logger.info(
+            f"Section {section_num}: merged {merged} continuation table(s) across page breaks."
+        )
+    return merged
+
+
+def _drop_repeated_header_rows_within_tables(src_doc, logger, section_num: str) -> int:
+    """
+    Removes repeated header rows that reappear inside the same table after
+    PDF page-split reconstruction.
+    """
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    removed = 0
+
+    for table_element in src_doc.element.body:
+        if table_element.tag.split('}')[-1] != 'tbl':
+            continue
+
+        rows = table_element.findall(f'{{{_NS}}}tr')
+        if len(rows) < 3:
+            continue
+
+        header_signature = _row_cell_signature(rows[0])
+        if len([x for x in header_signature if x]) < 2:
+            continue
+
+        for row in list(rows[1:]):
+            if _row_matches_header_signature(row, header_signature):
+                parent = row.getparent()
+                if parent is not None:
+                    parent.remove(row)
+                    removed += 1
+
+    if removed:
+        logger.info(
+            f"Section {section_num}: removed {removed} repeated header row(s) inside table body."
+        )
+    return removed
+
+
+def _drop_outlier_table_schemas(src_doc, logger, section_num: str) -> int:
+    """
+    Removes minority table schemas when one column layout clearly dominates.
+    This keeps page-split continuation tables and drops unrelated outlier tables.
+    """
+    from collections import Counter
+
+    table_elements = [
+        elem for elem in src_doc.element.body
+        if elem.tag.split('}')[-1] == 'tbl'
+    ]
+    if len(table_elements) < 2:
+        return 0
+
+    schema_by_table = []
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    for elem in table_elements:
+        first_row = elem.find(f'{{{_NS}}}tr')
+        if first_row is None:
+            continue
+        cols = len(first_row.findall(f'{{{_NS}}}tc'))
+        if cols <= 0:
+            continue
+        rows = len(elem.findall(f'.//{{{_NS}}}tr'))
+        text_chars = len(_element_text_content(elem))
+        schema_by_table.append((elem, cols, rows, text_chars))
+
+    if len(schema_by_table) < 2:
+        return 0
+
+    freq = Counter(cols for _, cols, _, _ in schema_by_table)
+    if len(freq) == 1:
+        return 0
+
+    schema_stats = {}
+    for _, cols, rows, text_chars in schema_by_table:
+        stat = schema_stats.setdefault(cols, {"count": 0, "rows": 0, "text": 0})
+        stat["count"] += 1
+        stat["rows"] += rows
+        stat["text"] += text_chars
+
+    dominant_cols, dominant_count = max(
+        schema_stats.items(),
+        key=lambda item: (item[1]["count"], item[1]["text"], item[1]["rows"]),
+    )
+    dominant_cols = int(dominant_cols)
+    dominant_stat = schema_stats[dominant_cols]
+
+    if dominant_count == len(schema_by_table):
+        return 0
+
+    total_tables = len(schema_by_table)
+    dominant_score = dominant_stat["rows"] + (dominant_stat["text"] / 120.0)
+
+    removed = 0
+    for elem, cols, rows, text_chars in schema_by_table:
+        if cols == dominant_cols:
+            continue
+
+        # With only two schema variants, remove the smaller one only when
+        # it is clearly an outlier by content volume.
+        if total_tables == 2:
+            this_score = rows + (text_chars / 120.0)
+            if dominant_score <= 0:
+                continue
+            if this_score > (0.55 * dominant_score):
+                continue
+
+        parent = elem.getparent()
+        if parent is not None:
+            parent.remove(elem)
+            removed += 1
+
+    if removed:
+        logger.info(
+            f"Section {section_num}: removed {removed} outlier table schema(s) "
+            f"(dominant columns={dominant_cols})."
+        )
+    return removed
 
 
 def _merge_split_tables(src_doc, logger, section_num: str) -> int:
@@ -1898,9 +2263,10 @@ def _append_rows_as_table(doc, current_anchor, headers, rows, force_new_table=Fa
         for r_idx, r in enumerate(reference_table.rows):
             if r_idx == 0:
                 continue
-            if not r.cells:
+            row_cells = _safe_row_cells(r)
+            if not row_cells:
                 continue
-            k = _norm_key(r.cells[0].text)
+            k = _norm_key(row_cells[0].text)
             if k:
                 existing_first_col.add(k)
 
@@ -2000,6 +2366,46 @@ def _remove_tables_until_next_section(anchor_xml, logger, section_num: str) -> i
     return removed
 
 
+def _remove_tables_after_anchor_until_subpoint(anchor_xml, logger, section_num: str) -> int:
+    """
+    Removes existing template table scaffolds after a subpoint anchor
+    (e.g. after (a)) until next subpoint/section heading.
+    """
+    removed = 0
+    nxt = anchor_xml.getnext()
+    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    while nxt is not None:
+        tag = nxt.tag.split('}')[-1]
+        if tag == 'p':
+            text = ''.join(t.text or '' for t in nxt.iter(f'{{{_NS}}}t')).strip()
+            low = text.lower()
+            if text and (
+                TEMPLATE_SECTION_PATTERN.search(text)
+                or re.match(r'^\s*\([b-z]\)', low)
+            ):
+                break
+            nxt = nxt.getnext()
+            continue
+
+        if tag == 'tbl':
+            parent = nxt.getparent()
+            to_remove = nxt
+            nxt = nxt.getnext()
+            if parent is not None:
+                parent.remove(to_remove)
+                removed += 1
+            continue
+
+        nxt = nxt.getnext()
+
+    if removed:
+        logger.info(
+            f"Section {section_num}: removed {removed} table scaffold(s) after subpoint anchor."
+        )
+    return removed
+
+
 def _add_section_spacing(anchor_xml, lines: int = 2):
     """Adds blank paragraph lines after current section content."""
     curr = anchor_xml
@@ -2036,6 +2442,23 @@ def _inject_docx_content(
 
     _clean_injected_content(src_doc, blocklist, logger, section_num)
     _merge_split_tables(src_doc, logger, section_num)
+
+    effective_include_pdf_tables = include_pdf_tables
+    suppress_paragraphs = False
+    if not include_pdf_tables:
+        layout = _analyze_injected_doc_layout(src_doc)
+        if _should_auto_include_tables(layout):
+            effective_include_pdf_tables = True
+            suppress_paragraphs = True
+            _drop_outlier_table_schemas(src_doc, logger, section_num)
+            _drop_consecutive_duplicate_table_headers(src_doc, logger, section_num)
+            _merge_consecutive_continuation_tables(src_doc, logger, section_num)
+            _drop_repeated_header_rows_within_tables(src_doc, logger, section_num)
+            logger.info(
+                f"Section {section_num}: detected table-dominant content "
+                f"(tables={layout['table_count']}, rich_tables={layout['rich_table_count']}, "
+                f"table_chars={layout['table_text_chars']}). Injecting tables automatically."
+            )
 
     inserted_nonblank = False
     pending_blank_para = None
@@ -2306,6 +2729,12 @@ def process_template(
                         if low.startswith("(b)") and "narrative description" in low:
                             current_anchor = p._p
                             break
+
+                _remove_tables_after_anchor_until_subpoint(
+                    anchor_xml=current_anchor,
+                    logger=logger,
+                    section_num=section_num,
+                )
 
             paragraph.clear()
 
