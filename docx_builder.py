@@ -15,6 +15,9 @@ import subprocess
 import sys
 import docx
 from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.table import _Cell
+from docx.text.paragraph import Paragraph
 import fitz
 from docx.shared import RGBColor, Inches
 from typing import Dict, Set
@@ -749,6 +752,460 @@ def _populate_s41_template_section(doc, anchor_xml, pdf_path: str, logger) -> bo
     return True
 
 
+def _extract_p332_batch_formula_data(pdf_path: str, logger):
+    data = {
+        "batch_size": "",
+        "label_header": "",
+        "rows": [],
+    }
+    doc = None
+
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            page_text = page.get_text("text", sort=True)
+            if not data["batch_size"]:
+                match = re.search(r"Batch\s*size\s*[-:]\s*(.+)", page_text, flags=re.IGNORECASE)
+                if match:
+                    data["batch_size"] = _clean_text(match.group(1))
+
+            try:
+                tables = page.find_tables().tables
+            except Exception:
+                tables = []
+
+            for table in tables:
+                raw_rows = table.extract()
+                if not raw_rows:
+                    continue
+
+                headers = [_clean_text(str(cell or "")) for cell in raw_rows[0]]
+                normalized = [header.lower() for header in headers]
+
+                ingredient_idx = next((i for i, text in enumerate(normalized) if "ingredient" in text), -1)
+                specification_idx = next((i for i, text in enumerate(normalized) if "specification" in text), -1)
+                labelled_idx = next(
+                    (i for i, text in enumerate(normalized) if "labelled amount" in text or "labeled amount" in text),
+                    -1,
+                )
+                batch_idx = next((i for i, text in enumerate(normalized) if "batch formula" in text), -1)
+
+                if min(ingredient_idx, specification_idx, labelled_idx, batch_idx) < 0:
+                    continue
+
+                parsed_rows = []
+                for raw_row in raw_rows[1:]:
+                    cells = [_clean_text(str(cell or "")) for cell in raw_row]
+                    max_idx = max(ingredient_idx, specification_idx, labelled_idx, batch_idx)
+                    if len(cells) <= max_idx:
+                        continue
+
+                    ingredient = cells[ingredient_idx]
+                    specification = cells[specification_idx]
+                    labelled_amount = cells[labelled_idx]
+                    batch_formula = cells[batch_idx]
+                    if not any((ingredient, specification, labelled_amount, batch_formula)):
+                        continue
+
+                    parsed_rows.append(
+                        {
+                            "ingredient": ingredient,
+                            "specification": specification,
+                            "labelled_amount": labelled_amount,
+                            "batch_formula": batch_formula,
+                        }
+                    )
+
+                if parsed_rows:
+                    data["label_header"] = headers[labelled_idx]
+                    data["rows"] = parsed_rows
+                    break
+
+            if data["rows"] and data["batch_size"]:
+                break
+    except Exception as e:
+        logger.warning(f"Section 3.2.P.3.2: failed to extract batch-formula table: {e}")
+    finally:
+        if doc is not None:
+            doc.close()
+
+    if not data["rows"]:
+        try:
+            helper_code = r"""
+import fitz, json, re, sys
+pdf_path = sys.argv[1]
+doc = fitz.open(pdf_path)
+data = {"batch_size": "", "label_header": "", "rows": []}
+for page in doc:
+    text = page.get_text("text", sort=True)
+    if not data["batch_size"]:
+        match = re.search(r"Batch\s*size\s*[-:]\s*(.+)", text, flags=re.IGNORECASE)
+        if match:
+            data["batch_size"] = re.sub(r"\s+", " ", match.group(1)).strip()
+    try:
+        tables = page.find_tables().tables
+    except Exception:
+        tables = []
+    for table in tables:
+        raw_rows = table.extract()
+        if not raw_rows:
+            continue
+        headers = [re.sub(r"\s+", " ", str(cell or "")).strip(" .:\n\t") for cell in raw_rows[0]]
+        normalized = [header.lower() for header in headers]
+        ingredient_idx = next((i for i, value in enumerate(normalized) if "ingredient" in value), -1)
+        specification_idx = next((i for i, value in enumerate(normalized) if "specification" in value), -1)
+        labelled_idx = next((i for i, value in enumerate(normalized) if "labelled amount" in value or "labeled amount" in value), -1)
+        batch_idx = next((i for i, value in enumerate(normalized) if "batch formula" in value), -1)
+        if min(ingredient_idx, specification_idx, labelled_idx, batch_idx) < 0:
+            continue
+        parsed_rows = []
+        for raw_row in raw_rows[1:]:
+            cells = [re.sub(r"\s+", " ", str(cell or "")).strip(" .:\n\t") for cell in raw_row]
+            max_idx = max(ingredient_idx, specification_idx, labelled_idx, batch_idx)
+            if len(cells) <= max_idx:
+                continue
+            ingredient = cells[ingredient_idx]
+            specification = cells[specification_idx]
+            labelled_amount = cells[labelled_idx]
+            batch_formula = cells[batch_idx]
+            if not any((ingredient, specification, labelled_amount, batch_formula)):
+                continue
+            parsed_rows.append({
+                "ingredient": ingredient,
+                "specification": specification,
+                "labelled_amount": labelled_amount,
+                "batch_formula": batch_formula,
+            })
+        if parsed_rows:
+            data["label_header"] = headers[labelled_idx]
+            data["rows"] = parsed_rows
+            break
+    if data["rows"] and data["batch_size"]:
+        break
+print(json.dumps(data, ensure_ascii=False))
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", helper_code, pdf_path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if completed.returncode == 0 and completed.stdout.strip():
+                recovered = json.loads(completed.stdout)
+                if isinstance(recovered, dict) and recovered.get("rows"):
+                    data = recovered
+                    logger.info("Section 3.2.P.3.2: recovered batch-formula rows via fresh-process fallback.")
+        except Exception as e:
+            logger.warning(f"Section 3.2.P.3.2: fresh-process fallback failed: {e}")
+
+    return data
+
+
+def _append_specification_suffix(ingredient: str, specification: str) -> str:
+    ingredient = _clean_text(ingredient)
+    specification = _clean_text(specification)
+    if not ingredient:
+        return ""
+    if not specification:
+        return ingredient
+    if re.search(rf"\b{re.escape(specification.lower())}\b", ingredient.lower()):
+        return ingredient
+    return f"{ingredient} {specification}".strip()
+
+
+def _split_batch_formula_parts(value: str):
+    value = value or ""
+    parts = [part.strip(" -") for part in re.split(r"(?:\r?\n|;)", value) if part.strip(" -")]
+    if len(parts) > 1:
+        return parts
+
+    matched_amounts = re.findall(
+        r"(?:q\.s\.\s*to\s*adjust\s*pH|to\s*\d+(?:\.\d+)?\s*[A-Za-z]+|\d+(?:\.\d+)?\s*(?:mg|g|kg|mcg|mL|ml|L|IU|units?))",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if matched_amounts:
+        return [match.strip() for match in matched_amounts if match.strip()]
+
+    return [_clean_text(value)] if value.strip() else []
+
+
+def _split_ingredient_parts(value: str):
+    value = value or ""
+    parts = [part.strip(" -") for part in re.split(r"(?:\r?\n|;)", value) if part.strip(" -")]
+    if len(parts) > 1:
+        return parts
+
+    match = re.search(r"(?i)\b(equivalent to\b.*)", value)
+    if match and value[:match.start()].strip():
+        return [value[:match.start()].strip(), match.group(1).strip()]
+
+    cleaned = _clean_text(value)
+    return [cleaned] if cleaned else []
+
+
+def _build_p332_strength_text(rows, label_header: str) -> str:
+    if not rows:
+        return ""
+
+    intro = "Each ml contains:" if "per ml" in (label_header or "").lower() else "Each unit contains:"
+    lines = [intro]
+
+    for row in rows:
+        ingredient_text = _append_specification_suffix(row.get("ingredient", ""), row.get("specification", ""))
+        amount_text = _clean_text(row.get("labelled_amount", ""))
+        if not ingredient_text or not amount_text:
+            continue
+
+        ingredient_parts = _split_ingredient_parts(ingredient_text)
+        amount_parts = _split_batch_formula_parts(amount_text)
+
+        if ingredient_parts and len(ingredient_parts) == len(amount_parts):
+            for ingredient_part, amount_part in zip(ingredient_parts, amount_parts):
+                lines.append(f"{ingredient_part}.......{amount_part}")
+            continue
+
+        if len(amount_parts) == 1:
+            lines.append(f"{ingredient_text}.......{amount_parts[0]}")
+            continue
+
+        lines.append(f"{ingredient_text}.......{amount_text}")
+
+    return "\n".join(lines)
+
+
+def _extract_p332_calculation_lines(pdf_path: str, logger):
+    lines = []
+    doc = None
+
+    def _collect_from_text(page_text: str):
+        collected = []
+        started = False
+        for raw_line in page_text.splitlines():
+            line = raw_line.strip()
+            if not started:
+                if line.lower().startswith("calculation"):
+                    started = True
+                    collected.append("Calculation:")
+                continue
+
+            stop_markers = (
+                "largest intended commercial batch size",
+                "other intended commercial batch sizes",
+                "<information on all intended commercial batch sizes",
+                "(a)",
+            )
+            if any(line.lower().startswith(marker) for marker in stop_markers):
+                break
+
+            if not line:
+                if collected and collected[-1] != "":
+                    collected.append("")
+                continue
+
+            collected.append(line)
+        return collected
+
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            page_text = page.get_text("text", sort=True)
+            if "Calculation" not in page_text:
+                continue
+            lines = _collect_from_text(page_text)
+            if lines:
+                break
+    except Exception as e:
+        logger.warning(f"Section 3.2.P.3.2: failed to extract calculation text: {e}")
+    finally:
+        if doc is not None:
+            doc.close()
+
+    if not lines:
+        try:
+            helper_code = r"""
+import fitz, json, sys
+pdf_path = sys.argv[1]
+doc = fitz.open(pdf_path)
+lines = []
+for page in doc:
+    text = page.get_text("text", sort=True)
+    if "Calculation" not in text:
+        continue
+    started = False
+    collected = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not started:
+            if line.lower().startswith("calculation"):
+                started = True
+                collected.append("Calculation:")
+            continue
+        stop_markers = (
+            "largest intended commercial batch size",
+            "other intended commercial batch sizes",
+            "<information on all intended commercial batch sizes",
+            "(a)",
+        )
+        if any(line.lower().startswith(marker) for marker in stop_markers):
+            break
+        if not line:
+            if collected and collected[-1] != "":
+                collected.append("")
+            continue
+        collected.append(line)
+    if collected:
+        lines = collected
+        break
+print(json.dumps(lines, ensure_ascii=False))
+"""
+            completed = subprocess.run(
+                [sys.executable, "-c", helper_code, pdf_path],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if completed.returncode == 0 and completed.stdout.strip():
+                recovered = json.loads(completed.stdout)
+                if isinstance(recovered, list) and recovered:
+                    lines = recovered
+        except Exception as e:
+            logger.warning(f"Section 3.2.P.3.2: calculation-text fallback failed: {e}")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _append_paragraph_after_xml(anchor_xml, text: str = "", *, center: bool = False, bold: bool = False):
+    new_p = OxmlElement('w:p')
+    if center:
+        p_pr = OxmlElement('w:pPr')
+        jc = OxmlElement('w:jc')
+        jc.set(qn('w:val'), 'center')
+        p_pr.append(jc)
+        new_p.append(p_pr)
+    if text:
+        run = OxmlElement('w:r')
+        if bold:
+            r_pr = OxmlElement('w:rPr')
+            b = OxmlElement('w:b')
+            r_pr.append(b)
+            run.append(r_pr)
+        t = OxmlElement('w:t')
+        if text.startswith(" ") or text.endswith(" "):
+            t.set(qn('xml:space'), 'preserve')
+        t.text = text
+        run.append(t)
+        new_p.append(run)
+    anchor_xml.addnext(new_p)
+    return new_p
+
+
+def _insert_p332_calculation_block(table, lines, logger) -> None:
+    if not lines:
+        return
+
+    current_anchor = table._tbl
+
+    for line in lines:
+        if not line:
+            current_anchor = _append_paragraph_after_xml(current_anchor, "")
+            continue
+        low = line.lower()
+        bold = low.startswith("calculation") or low.startswith("for batch size") or line.startswith("*")
+        center = (
+            low.startswith("=")
+            or (" x " in line and any(ch.isdigit() for ch in line))
+            or ("required qty in kg" in low)
+            or ("assay a" in low and "lod" in low)
+        )
+        current_anchor = _append_paragraph_after_xml(
+            current_anchor,
+            line,
+            center=center,
+            bold=bold,
+        )
+
+    logger.info(f"Section 3.2.P.3.2: inserted calculation block with {len(lines)} line(s) below table.")
+
+
+def _populate_p332_template_section(doc, anchor_xml, pdf_path: str, logger) -> bool:
+    largest_batch_para = _find_section_block_after_anchor(
+        doc,
+        anchor_xml,
+        want_table=False,
+        paragraph_prefix="largest intended commercial batch size",
+    )
+    other_batch_para = _find_section_block_after_anchor(
+        doc,
+        anchor_xml,
+        want_table=False,
+        paragraph_prefix="other intended commercial batch sizes",
+    )
+    info_para = _find_section_block_after_anchor(
+        doc,
+        anchor_xml,
+        want_table=False,
+        paragraph_prefix="<information on all intended commercial batch sizes",
+    )
+    table = _find_section_block_after_anchor(doc, anchor_xml, want_table=True)
+    if table is None or len(table.columns) < 4 or len(table.rows) < 4:
+        return False
+
+    extracted = _extract_p332_batch_formula_data(pdf_path, logger)
+    ingredient_rows = extracted.get("rows", [])
+    calculation_lines = _extract_p332_calculation_lines(pdf_path, logger)
+    if not ingredient_rows:
+        logger.warning("Section 3.2.P.3.2: no batch-formula rows found for template table.")
+        return False
+
+    batch_size = extracted.get("batch_size", "")
+    strength_text = _build_p332_strength_text(ingredient_rows, extracted.get("label_header", ""))
+
+    if largest_batch_para is not None:
+        largest_batch_para.text = f"Largest intended commercial batch size: {batch_size}".strip()
+    if other_batch_para is not None:
+        other_batch_para.text = "Other intended commercial batch sizes: ------"
+    if info_para is not None:
+        info_para.text = ""
+
+    _set_cell_text(table.rows[0].cells[1], strength_text)
+    _set_cell_text(table.rows[0].cells[2], "Not Applicable")
+    _set_cell_text(table.rows[0].cells[3], "Not Applicable")
+
+    _set_cell_text(table.rows[1].cells[1], "------")
+    _set_cell_text(table.rows[1].cells[2], "")
+    _set_cell_text(table.rows[1].cells[3], "")
+
+    _set_cell_text(table.rows[2].cells[1], batch_size)
+    _set_cell_text(table.rows[2].cells[2], "")
+    _set_cell_text(table.rows[2].cells[3], "")
+
+    while len(table.rows) > 4:
+        row = table.rows[-1]._tr
+        row.getparent().remove(row)
+
+    for row_data in ingredient_rows:
+        row = table.add_row()
+        _set_cell_text(
+            row.cells[0],
+            _append_specification_suffix(row_data.get("ingredient", ""), row_data.get("specification", "")),
+        )
+        _set_cell_text(row.cells[1], row_data.get("batch_formula", ""))
+        _set_cell_text(row.cells[2], "")
+        _set_cell_text(row.cells[3], "")
+
+    _insert_p332_calculation_block(table, calculation_lines, logger)
+
+    logger.info(f"Section 3.2.P.3.2: populated template batch-formula table with {len(ingredient_rows)} row(s).")
+    return True
+
+
 def _extract_p334_controls_rows(pdf_path: str, logger):
     """
     Groups critical control rows into [step, controls summary] pairs
@@ -1148,10 +1605,11 @@ def _iter_all_paragraphs(doc):
     for p in doc.paragraphs:
         yield p
     for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    yield p
+        for tr in table._tbl.tr_lst:
+            for tc in tr.tc_lst:
+                cell = _Cell(tc, table)
+                for p in tc.p_lst:
+                    yield Paragraph(p, cell)
 
 
 def _insert_warning(paragraph, section: str):
@@ -1185,231 +1643,6 @@ def _strip_drawing_elements(element):
                 parent.remove(node)
             except Exception:
                 pass
-
-def _analyze_injected_doc_layout(src_doc) -> dict:
-    """Computes simple structure metrics used to decide table auto-inclusion."""
-    body_elements = [
-        elem for elem in src_doc.element.body
-        if elem.tag.split('}')[-1] != 'sectPr'
-    ]
-
-    table_count = 0
-    rich_table_count = 0
-    table_text_chars = 0
-    nonblank_paragraph_count = 0
-
-    for elem in body_elements:
-        tag_name = elem.tag.split('}')[-1]
-        if tag_name == 'tbl':
-            table_count += 1
-            tbl_text = _element_text_content(elem)
-            table_text_chars += len(tbl_text)
-
-            rows = len(elem.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr'))
-            first_row = elem.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr')
-            cols = len(first_row.findall('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc')) if first_row is not None else 0
-
-            if rows >= 8 and cols >= 3 and len(tbl_text) >= 250:
-                rich_table_count += 1
-        elif tag_name == 'p':
-            if _element_text_content(elem):
-                nonblank_paragraph_count += 1
-
-    return {
-        "table_count": table_count,
-        "rich_table_count": rich_table_count,
-        "table_text_chars": table_text_chars,
-        "nonblank_paragraph_count": nonblank_paragraph_count,
-    }
-
-
-def _should_auto_include_tables(layout: dict) -> bool:
-    """
-    Enables table injection for table-dominant converted sections.
-    Keeps behavior generic and avoids section-specific hardcoding.
-    """
-    return (
-        layout.get("rich_table_count", 0) >= 2
-        and layout.get("table_count", 0) >= 2
-        and layout.get("table_text_chars", 0) >= 1000
-        and layout.get("nonblank_paragraph_count", 0) <= 4
-    )
-
-
-def _table_header_signature(table_element) -> str:
-    """Builds a normalized signature from the first row of a table element."""
-    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    first_row = table_element.find(f'{{{_NS}}}tr')
-    if first_row is None:
-        return ""
-
-    cells = first_row.findall(f'{{{_NS}}}tc')
-    if not cells:
-        return ""
-
-    parts: list[str] = []
-    for cell in cells:
-        text = ''.join(t.text or '' for t in cell.iter(f'{{{_NS}}}t'))
-        norm = re.sub(r'\s+', ' ', text).strip().lower()
-        parts.append(norm)
-
-    non_empty = [p for p in parts if p]
-    if len(non_empty) < 2:
-        return ""
-    return '|'.join(parts)
-
-
-def _table_column_count(table_element) -> int:
-    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    first_row = table_element.find(f'{{{_NS}}}tr')
-    if first_row is None:
-        return 0
-    return len(first_row.findall(f'{{{_NS}}}tc'))
-
-
-def _drop_consecutive_duplicate_table_headers(src_doc, logger, section_num: str) -> int:
-    """
-    Removes first-row headers that repeat across consecutive tables.
-    This handles PDF page-split continuation tables cleanly.
-    """
-    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    removed = 0
-    last_header_signature = ""
-
-    for element in src_doc.element.body:
-        if element.tag.split('}')[-1] != 'tbl':
-            continue
-
-        signature = _table_header_signature(element)
-        if not signature:
-            continue
-
-        rows = element.findall(f'{{{_NS}}}tr')
-        if (
-            last_header_signature
-            and signature == last_header_signature
-            and len(rows) > 1
-        ):
-            first_row = rows[0]
-            parent = first_row.getparent()
-            if parent is not None:
-                parent.remove(first_row)
-                removed += 1
-            continue
-
-        last_header_signature = signature
-
-    if removed:
-        logger.info(
-            f"Section {section_num}: removed {removed} repeated continuation table header row(s)."
-        )
-    return removed
-
-
-def _merge_consecutive_continuation_tables(src_doc, logger, section_num: str) -> int:
-    """
-    Merges consecutive tables that share the same column schema and are not
-    separated by non-empty paragraphs. This smooths page-break table splits.
-    """
-    _NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    merged = 0
-
-    previous_table = None
-    previous_cols = 0
-    paragraph_between = False
-
-    for elem in list(src_doc.element.body):
-        tag_name = elem.tag.split('}')[-1]
-
-        if tag_name == 'p':
-            if _element_text_content(elem):
-                paragraph_between = True
-            continue
-
-        if tag_name != 'tbl':
-            previous_table = None
-            previous_cols = 0
-            paragraph_between = False
-            continue
-
-        cols = _table_column_count(elem)
-        can_merge = (
-            previous_table is not None
-            and not paragraph_between
-            and cols > 0
-            and cols == previous_cols
-        )
-
-        if can_merge:
-            for row in elem.findall(f'{{{_NS}}}tr'):
-                previous_table.append(copy.deepcopy(row))
-
-            parent = elem.getparent()
-            if parent is not None:
-                parent.remove(elem)
-            merged += 1
-            paragraph_between = False
-            continue
-
-        previous_table = elem
-        previous_cols = cols
-        paragraph_between = False
-
-    if merged:
-        logger.info(
-            f"Section {section_num}: merged {merged} continuation table(s) across page breaks."
-        )
-    return merged
-
-
-def _drop_outlier_table_schemas(src_doc, logger, section_num: str) -> int:
-    """
-    Removes minority table schemas when one column layout clearly dominates.
-    This keeps page-split continuation tables and drops unrelated outlier tables.
-    """
-    from collections import Counter
-
-    table_elements = [
-        elem for elem in src_doc.element.body
-        if elem.tag.split('}')[-1] == 'tbl'
-    ]
-    if len(table_elements) < 3:
-        return 0
-
-    schema_by_table = []
-    for elem in table_elements:
-        first_row = elem.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tr')
-        if first_row is None:
-            continue
-        cols = len(first_row.findall('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tc'))
-        if cols <= 0:
-            continue
-        schema_by_table.append((elem, cols))
-
-    if len(schema_by_table) < 3:
-        return 0
-
-    freq = Counter(cols for _, cols in schema_by_table)
-    dominant_cols, dominant_count = max(freq.items(), key=lambda item: item[1])
-
-    if dominant_count < 2 or dominant_count == len(schema_by_table):
-        return 0
-
-    removed = 0
-    for elem, cols in schema_by_table:
-        if cols == dominant_cols:
-            continue
-        parent = elem.getparent()
-        if parent is not None:
-            parent.remove(elem)
-            removed += 1
-
-    if removed:
-        logger.info(
-            f"Section {section_num}: removed {removed} outlier table schema(s) "
-            f"(dominant columns={dominant_cols})."
-        )
-    return removed
 
 
 def _merge_split_tables(src_doc, logger, section_num: str) -> int:
@@ -1804,22 +2037,6 @@ def _inject_docx_content(
     _clean_injected_content(src_doc, blocklist, logger, section_num)
     _merge_split_tables(src_doc, logger, section_num)
 
-    effective_include_pdf_tables = include_pdf_tables
-    suppress_paragraphs = False
-    if not include_pdf_tables:
-        layout = _analyze_injected_doc_layout(src_doc)
-        if _should_auto_include_tables(layout):
-            effective_include_pdf_tables = True
-            suppress_paragraphs = True
-            _drop_outlier_table_schemas(src_doc, logger, section_num)
-            _drop_consecutive_duplicate_table_headers(src_doc, logger, section_num)
-            _merge_consecutive_continuation_tables(src_doc, logger, section_num)
-            logger.info(
-                f"Section {section_num}: detected table-dominant content "
-                f"(tables={layout['table_count']}, rich_tables={layout['rich_table_count']}, "
-                f"table_chars={layout['table_text_chars']}). Injecting tables automatically."
-            )
-
     inserted_nonblank = False
     pending_blank_para = None
 
@@ -1854,7 +2071,7 @@ def _inject_docx_content(
         if table_only:
             if not is_table:
                 continue
-        elif not effective_include_pdf_tables and is_table:
+        elif not include_pdf_tables and is_table:
             continue
 
         if table_only and keyword and is_table:
@@ -1883,8 +2100,6 @@ def _inject_docx_content(
                 continue
 
         if tag_name == 'p':
-            if suppress_paragraphs:
-                continue
             if not _element_text_content(element):
                 # Drop leading blanks and compress internal blank runs.
                 if not inserted_nonblank:
@@ -2050,6 +2265,14 @@ def process_template(
                     logger.info(f"Section {section_num}: populated successfully.")
                     continue
 
+            if section_num == "3.2.P.3.2":
+                paragraph.clear()
+                if _populate_p332_template_section(doc, current_anchor, pdf_path, logger):
+                    sections_filled += 1
+                    processed_sections.add(section_num)
+                    logger.info(f"Section {section_num}: populated successfully.")
+                    continue
+
             content = extract_pdf_content(
                 pdf_path            = pdf_path,
                 log_folder          = log_folder,
@@ -2081,19 +2304,6 @@ def process_template(
                     for p in doc.paragraphs[paragraph_index + 1 : paragraph_index + 10]:
                         low = p.text.strip().lower()
                         if low.startswith("(b)") and "narrative description" in low:
-                            current_anchor = p._p
-                            break
-            elif section_num == "3.2.P.3.4":
-                # Insert extracted controls tables after the template (a) summary line.
-                paragraph_index = None
-                for idx, p in enumerate(doc.paragraphs):
-                    if p._p == paragraph._p:
-                        paragraph_index = idx
-                        break
-                if paragraph_index is not None:
-                    for p in doc.paragraphs[paragraph_index + 1 : paragraph_index + 14]:
-                        low = p.text.strip().lower()
-                        if low.startswith("(a)") and "summary of controls performed at the critical steps" in low:
                             current_anchor = p._p
                             break
 
